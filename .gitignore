@@ -1,0 +1,7 @@
+build/
+*.bin
+*.o
+*.img
+*.log
+tags
+cscope.*
