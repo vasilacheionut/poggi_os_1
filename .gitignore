@@ -1,4 +1,10 @@
 # Build artifacts
+
+*.o
+*.bin
+*.img
+*.iso
+
 build/
 *.o
 *.bin
