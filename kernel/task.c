@@ -1,83 +1,131 @@
 // kernel/task.c
 #include "task.h"
 #include "../drivers/vga.h"
+#include "../include/string.h"
+#include <stdint.h>
 
-// Declarăm funcția din asamblare
-extern void switch_context(unsigned long *old_rsp, unsigned long new_rsp);
+// Declară funcțiile externe (din heap)
+extern void *kmalloc(int size);
+extern void kfree(void *ptr);
 
-TaskControlBlock task_table[MAX_TASKS];
-int current_task_idx = 0;
-int total_tasks = 0;
+#define MAX_TASKS 16
+#define TASK_RUNNING 0
+#define TASK_READY 1
+#define TASK_WAITING 2
 
-// Inițializăm tabela (Task 0 este chiar Kernel Main)
+typedef struct
+{
+    void *stack;
+    uint64_t rsp;
+    uint64_t rbp;
+    int state;
+    int id;
+} task_t;
+
+static task_t tasks[MAX_TASKS];
+static int current_task = 0;
+static int next_task_id = 1;
+
 void task_init(void)
 {
     for (int i = 0; i < MAX_TASKS; i++)
     {
-        task_table[i].id = i;
-        task_table[i].state = 0; // State: Free
-        task_table[i].rsp = 0;
+        tasks[i].stack = 0;
+        tasks[i].state = TASK_WAITING;
+        tasks[i].id = -1;
     }
-
-    // Înregistrăm Kernel Main drept Task 0
-    task_table[0].state = 2; // Running
-    total_tasks = 1;
-    current_task_idx = 0;
+    tasks[0].stack = 0;
+    tasks[0].state = TASK_RUNNING;
+    tasks[0].id = 0;
+    current_task = 0;
+    kprint("Task manager initializat.\n");
 }
 
-// Creează un task nou și îi pregătește stiva ca și cum ar fi fost suspendat
-void task_create(void (*entry_point)(void))
+int task_create(void (*fn)(void))
 {
-    if (total_tasks >= MAX_TASKS)
-        return;
-
-    int idx = total_tasks;
-    TaskControlBlock *t = &task_table[idx];
-
-    t->state = 1; // Ready
-
-    // Configurăm vârful stivei (stiva crește în jos în memorie)
-    unsigned long *stack_top = (unsigned long *)&t->stack[STACK_SIZE];
-
-    // Simulăm stiva în momentul unui switch:
-    // Când noul task va primi prima dată 'ret', va sări direct la entry_point
-    stack_top--;
-    *stack_top = (unsigned long)entry_point; // RIP initial
-
-    // Adăugăm spațiu gol pentru cele 15 registre pe care 'switch_context' le va face POP
-    for (int i = 0; i < 15; i++)
+    int id = -1;
+    for (int i = 1; i < MAX_TASKS; i++)
     {
-        stack_top--;
-        *stack_top = 0; // Inițializăm registrele simulate cu 0
+        if (tasks[i].stack == 0)
+        {
+            id = i;
+            break;
+        }
     }
-
-    t->rsp = (unsigned long)stack_top;
-    total_tasks++;
+    if (id == -1)
+    {
+        kprint("Eroare: prea multe task-uri!\n");
+        return -1;
+    }
+    tasks[id].stack = (void *)kmalloc(8192);
+    if (!tasks[id].stack)
+    {
+        kprint("Eroare: nu se poate aloca stiva pentru task!\n");
+        return -1;
+    }
+    uint64_t *stack_top = (uint64_t *)((uint64_t)tasks[id].stack + 8192);
+    *(--stack_top) = (uint64_t)fn;
+    *(--stack_top) = 0;
+    tasks[id].rsp = (uint64_t)stack_top;
+    tasks[id].rbp = (uint64_t)stack_top;
+    tasks[id].state = TASK_READY;
+    tasks[id].id = next_task_id++;
+    kprint("Task creat cu ID ");
+    kprint(itoa(tasks[id].id, 10));
+    kprint("\n");
+    return tasks[id].id;
 }
 
-// Schimbă manual și de bunăvoie execuția către următorul task disponibil
 void task_yield(void)
 {
-    int old_idx = current_task_idx;
-    int next_idx = (current_task_idx + 1) % total_tasks;
-
-    // Căutăm următorul task gata de rulare
-    while (task_table[next_idx].state != 1 && task_table[next_idx].state != 2)
+    __asm__ volatile(
+        "mov %%rsp, %0\n"
+        "mov %%rbp, %1\n"
+        : "=m"(tasks[current_task].rsp), "=m"(tasks[current_task].rbp));
+    int next = (current_task + 1) % MAX_TASKS;
+    int found = 0;
+    for (int i = 0; i < MAX_TASKS; i++)
     {
-        next_idx = (next_idx + 1) % total_tasks;
+        if (tasks[next].state == TASK_READY)
+        {
+            found = 1;
+            break;
+        }
+        next = (next + 1) % MAX_TASKS;
     }
+    if (!found)
+        return;
+    tasks[current_task].state = TASK_READY;
+    tasks[next].state = TASK_RUNNING;
+    current_task = next;
+    __asm__ volatile(
+        "mov %0, %%rsp\n"
+        "mov %1, %%rbp\n"
+        :
+        : "r"(tasks[current_task].rsp), "r"(tasks[current_task].rbp));
+}
 
-    if (next_idx == old_idx)
-        return; // Nu avem alt task disponibil
-
-    // Actualizăm stările
-    if (task_table[old_idx].state == 2)
+void task_list(void)
+{
+    kprint("Task list:\n");
+    for (int i = 0; i < MAX_TASKS; i++)
     {
-        task_table[old_idx].state = 1; // Din Running devine Ready
+        if (tasks[i].stack != 0 || i == 0)
+        {
+            kprint("  ID ");
+            kprint(itoa(tasks[i].id, 10));
+            kprint(": ");
+            if (tasks[i].state == TASK_RUNNING)
+                kprint("RUNNING");
+            else if (tasks[i].state == TASK_READY)
+                kprint("READY");
+            else if (tasks[i].state == TASK_WAITING)
+                kprint("WAITING");
+            else
+                kprint("INACTIVE");
+            if (i == 0)
+                kprint(" (kernel)");
+            kprint("\n");
+        }
     }
-    task_table[next_idx].state = 2; // Noul task devine Running
-    current_task_idx = next_idx;
-
-    // Apelăm funcția hardware din asamblare pentru switch-ul fizic
-    switch_context(&task_table[old_idx].rsp, task_table[next_idx].rsp);
 }

@@ -1,0 +1,2 @@
+echo Salut din autorun!
+poggi
